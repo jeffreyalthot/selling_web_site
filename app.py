@@ -4,6 +4,7 @@ import io
 import json
 import mimetypes
 import os
+import http.client
 import urllib.error
 import urllib.request
 import zipfile
@@ -16,6 +17,7 @@ BTC_ADDRESS = "19Tf5K7eZY6umSpaCktKfaf5ZTWv7qQvw6"
 BLOCKSTREAM_API = "https://blockstream.info/api"
 WALLET_DIR = Path("wallet_folder")
 STATIC_DIR = Path("static")
+PAYMENT_STATE_FILE = Path("payment_state.json")
 
 
 def sat_to_btc(sats: int) -> float:
@@ -34,6 +36,8 @@ def fetch_text(url: str) -> str:
 
 def get_latest_incoming_transaction(address: str):
     txs = fetch_json(f"{BLOCKSTREAM_API}/address/{address}/txs")
+    tip_height = None
+    latest_incoming_tx = None
 
     for tx in txs:
         amount_sats = 0
@@ -41,23 +45,70 @@ def get_latest_incoming_transaction(address: str):
             if vout.get("scriptpubkey_address") == address:
                 amount_sats += int(vout.get("value", 0))
 
-        if amount_sats > 0:
-            status = tx.get("status", {})
-            confirmations = 0
-            if status.get("confirmed"):
-                tip_height = int(fetch_text(f"{BLOCKSTREAM_API}/blocks/tip/height"))
-                block_height = int(status.get("block_height", 0))
-                confirmations = max(1, tip_height - block_height + 1)
+        if amount_sats <= 0:
+            continue
 
-            return {
-                "txid": tx.get("txid"),
-                "amount_sats": amount_sats,
-                "amount_btc": sat_to_btc(amount_sats),
-                "confirmations": confirmations,
-                "required_confirmations": 1,
-                "is_unlocked": confirmations >= 1,
-            }
+        if latest_incoming_tx is None:
+            latest_incoming_tx = tx
+
+        status = tx.get("status", {})
+        confirmations = 0
+        if status.get("confirmed"):
+            if tip_height is None:
+                tip_height = int(fetch_text(f"{BLOCKSTREAM_API}/blocks/tip/height"))
+            block_height = int(status.get("block_height", 0))
+            confirmations = max(1, tip_height - block_height + 1)
+
+        tx_info = {
+            "txid": tx.get("txid"),
+            "amount_sats": amount_sats,
+            "amount_btc": sat_to_btc(amount_sats),
+            "confirmations": confirmations,
+            "required_confirmations": 1,
+            "is_unlocked": confirmations >= 1,
+        }
+
+        if tx_info["is_unlocked"]:
+            return tx_info
+
+    if latest_incoming_tx:
+        amount_sats = 0
+        for vout in latest_incoming_tx.get("vout", []):
+            if vout.get("scriptpubkey_address") == address:
+                amount_sats += int(vout.get("value", 0))
+        return {
+            "txid": latest_incoming_tx.get("txid"),
+            "amount_sats": amount_sats,
+            "amount_btc": sat_to_btc(amount_sats),
+            "confirmations": 0,
+            "required_confirmations": 1,
+            "is_unlocked": False,
+        }
+
     return None
+
+
+def load_payment_state() -> dict:
+    if not PAYMENT_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(PAYMENT_STATE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_payment_state(state: dict) -> None:
+    PAYMENT_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def list_wallet_folder_contents() -> list[str]:
+    if not WALLET_DIR.exists() or not WALLET_DIR.is_dir():
+        return []
+    return sorted(
+        str(path.relative_to(WALLET_DIR)).replace("\\", "/")
+        for path in WALLET_DIR.rglob("*")
+        if path.is_file()
+    )
 
 
 def render_index_html() -> str:
@@ -92,9 +143,20 @@ def render_index_html() -> str:
             <span class=\"label\">Confirmations</span>
             <strong id=\"confirmations-text\">0 / 1</strong>
           </div>
+          <div>
+            <span class=\"label\">TXID complet (transaction entrante)</span>
+            <code id=\"txid-text\">-</code>
+          </div>
         </div>
 
         <a id=\"download-link\" class=\"btn hidden\" href=\"/download/wallet-folder\">Télécharger le dossier wallet_folder</a>
+
+        <section class=\"preview-window\">
+          <h2>Contenu de wallet_folder (aperçu)</h2>
+          <p id=\"preview-status\" class=\"preview-status\">Contenu verrouillé jusqu'à la confirmation du paiement (1/1).</p>
+          <pre id=\"folder-preview\">🔒 Paiement requis pour voir les fichiers.</pre>
+        </section>
+
         <p id=\"error-text\" class=\"error\"></p>
       </section>
     </main>
@@ -104,7 +166,10 @@ def render_index_html() -> str:
         const statusText = document.getElementById('status-text');
         const amountText = document.getElementById('amount-text');
         const confirmationsText = document.getElementById('confirmations-text');
+        const txidText = document.getElementById('txid-text');
         const downloadLink = document.getElementById('download-link');
+        const previewStatus = document.getElementById('preview-status');
+        const folderPreview = document.getElementById('folder-preview');
         const errorText = document.getElementById('error-text');
 
         try {{
@@ -121,19 +186,29 @@ def render_index_html() -> str:
             statusText.textContent = data.message;
             amountText.textContent = '-';
             confirmationsText.textContent = '0 / 1';
+            txidText.textContent = '-';
             downloadLink.classList.add('hidden');
+            previewStatus.textContent = "Contenu verrouillé jusqu'à la confirmation du paiement (1/1).";
+            folderPreview.textContent = '🔒 Paiement requis pour voir les fichiers.';
             return;
           }}
 
           amountText.textContent = `${{data.amount_btc.toFixed(8)}} BTC`;
           confirmationsText.textContent = `${{Math.min(data.confirmations, 1)}} / 1`;
+          txidText.textContent = data.txid || '-';
 
           if (data.is_unlocked) {{
-            statusText.textContent = `Transaction confirmée (${{data.txid}}). Téléchargement disponible.`;
+            statusText.textContent = 'Transaction confirmée. Téléchargement disponible.';
             downloadLink.classList.remove('hidden');
+            previewStatus.textContent = 'Paiement validé: fichiers disponibles en aperçu.';
+            folderPreview.textContent = (data.folder_contents && data.folder_contents.length)
+              ? data.folder_contents.join('\\n')
+              : 'Aucun fichier trouvé dans wallet_folder.';
           }} else {{
-            statusText.textContent = `Transaction détectée (${{data.txid}}). En attente de confirmation...`;
+            statusText.textContent = 'Transaction détectée. En attente de confirmation...';
             downloadLink.classList.add('hidden');
+            previewStatus.textContent = "Contenu verrouillé jusqu'à la confirmation du paiement (1/1).";
+            folderPreview.textContent = '🔒 Paiement requis pour voir les fichiers.';
           }}
         }} catch (error) {{
           errorText.textContent = `Impossible de vérifier le paiement: ${{error.message}}`;
@@ -194,11 +269,30 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/payment-status":
+            state = load_payment_state()
             try:
                 tx = get_latest_incoming_transaction(BTC_ADDRESS)
-            except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            except (urllib.error.URLError, TimeoutError, ValueError, http.client.RemoteDisconnected, OSError) as exc:
+                if state.get("is_unlocked"):
+                    self.send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "has_transaction": True,
+                            **state,
+                            "message": f"Mode cache actif (API indisponible: {exc})",
+                            "folder_contents": list_wallet_folder_contents(),
+                        },
+                    )
+                    return
                 self.send_json(503, {"ok": False, "error": f"API indisponible: {exc}"})
                 return
+
+            if tx and tx.get("is_unlocked"):
+                state = {**tx, "is_unlocked": True}
+                save_payment_state(state)
+            elif state.get("is_unlocked"):
+                tx = state
 
             if not tx:
                 self.send_json(
@@ -211,15 +305,28 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
-            self.send_json(200, {"ok": True, "has_transaction": True, **tx})
+            self.send_json(
+                200,
+                {
+                    "ok": True,
+                    "has_transaction": True,
+                    **tx,
+                    "folder_contents": list_wallet_folder_contents() if tx.get("is_unlocked") else [],
+                },
+            )
             return
 
         if path == "/download/wallet-folder":
+            state = load_payment_state()
             try:
                 tx = get_latest_incoming_transaction(BTC_ADDRESS)
-            except (urllib.error.URLError, TimeoutError, ValueError):
-                self.send_text(503, "Vérification du paiement impossible pour le moment.")
-                return
+            except (urllib.error.URLError, TimeoutError, ValueError, http.client.RemoteDisconnected, OSError):
+                tx = state if state.get("is_unlocked") else None
+
+            if tx and tx.get("is_unlocked"):
+                save_payment_state({**tx, "is_unlocked": True})
+            elif state.get("is_unlocked"):
+                tx = state
 
             if not tx or tx["confirmations"] < 1:
                 self.send_text(403, "Téléchargement verrouillé: une confirmation est requise.")

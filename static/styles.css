@@ -67,6 +67,35 @@ code {
   font-weight: 600;
 }
 
+.preview-window {
+  margin-top: 1.5rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  padding: 1rem;
+  background: #f8fafc;
+}
+
+.preview-window h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.preview-status {
+  margin: 0 0 0.75rem;
+  color: #334155;
+}
+
+#folder-preview {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 0.75rem;
+  border-radius: 10px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 0.85rem;
+}
+
 .hidden {
   display: none;
 }
