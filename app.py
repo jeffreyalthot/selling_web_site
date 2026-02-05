@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import io
+import json
+import mimetypes
+import os
+import urllib.error
+import urllib.request
+import zipfile
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+BTC_ADDRESS = "19Tf5K7eZY6umSpaCktKfaf5ZTWv7qQvw6"
+BLOCKSTREAM_API = "https://blockstream.info/api"
+WALLET_DIR = Path("wallet_folder")
+STATIC_DIR = Path("static")
+
+
+def sat_to_btc(sats: int) -> float:
+    return sats / 100_000_000
+
+
+def fetch_json(url: str):
+    with urllib.request.urlopen(url, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_text(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=15) as response:
+        return response.read().decode("utf-8").strip()
+
+
+def get_latest_incoming_transaction(address: str):
+    txs = fetch_json(f"{BLOCKSTREAM_API}/address/{address}/txs")
+
+    for tx in txs:
+        amount_sats = 0
+        for vout in tx.get("vout", []):
+            if vout.get("scriptpubkey_address") == address:
+                amount_sats += int(vout.get("value", 0))
+
+        if amount_sats > 0:
+            status = tx.get("status", {})
+            confirmations = 0
+            if status.get("confirmed"):
+                tip_height = int(fetch_text(f"{BLOCKSTREAM_API}/blocks/tip/height"))
+                block_height = int(status.get("block_height", 0))
+                confirmations = max(1, tip_height - block_height + 1)
+
+            return {
+                "txid": tx.get("txid"),
+                "amount_sats": amount_sats,
+                "amount_btc": sat_to_btc(amount_sats),
+                "confirmations": confirmations,
+                "required_confirmations": 1,
+                "is_unlocked": confirmations >= 1,
+            }
+    return None
+
+
+def render_index_html() -> str:
+    return f"""<!doctype html>
+<html lang=\"fr\">
+  <head>
+    <meta charset=\"UTF-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+    <title>Plateforme Transaction BTC</title>
+    <link rel=\"stylesheet\" href=\"/static/styles.css\" />
+  </head>
+  <body>
+    <main class=\"container\">
+      <section class=\"card\">
+        <h1>Plateforme temporaire de transaction</h1>
+        <p class=\"subtitle\">Paiement Bitcoin avec vérification automatique (1/1 confirmation)</p>
+
+        <div class=\"info-grid\">
+          <div>
+            <span class=\"label\">Adresse BTC de réception</span>
+            <code id=\"btc-address\">{BTC_ADDRESS}</code>
+          </div>
+          <div>
+            <span class=\"label\">État de la transaction</span>
+            <strong id=\"status-text\">En attente d'une transaction entrante...</strong>
+          </div>
+          <div>
+            <span class=\"label\">Montant détecté</span>
+            <strong id=\"amount-text\">-</strong>
+          </div>
+          <div>
+            <span class=\"label\">Confirmations</span>
+            <strong id=\"confirmations-text\">0 / 1</strong>
+          </div>
+        </div>
+
+        <a id=\"download-link\" class=\"btn hidden\" href=\"/download/wallet-folder\">Télécharger le dossier wallet_folder</a>
+        <p id=\"error-text\" class=\"error\"></p>
+      </section>
+    </main>
+
+    <script>
+      async function refreshPaymentStatus() {{
+        const statusText = document.getElementById('status-text');
+        const amountText = document.getElementById('amount-text');
+        const confirmationsText = document.getElementById('confirmations-text');
+        const downloadLink = document.getElementById('download-link');
+        const errorText = document.getElementById('error-text');
+
+        try {{
+          const response = await fetch('/api/payment-status');
+          const data = await response.json();
+
+          if (!response.ok || !data.ok) {{
+            throw new Error(data.error || 'Erreur inconnue lors de la vérification.');
+          }}
+
+          errorText.textContent = '';
+
+          if (!data.has_transaction) {{
+            statusText.textContent = data.message;
+            amountText.textContent = '-';
+            confirmationsText.textContent = '0 / 1';
+            downloadLink.classList.add('hidden');
+            return;
+          }}
+
+          amountText.textContent = `${{data.amount_btc.toFixed(8)}} BTC`;
+          confirmationsText.textContent = `${{Math.min(data.confirmations, 1)}} / 1`;
+
+          if (data.is_unlocked) {{
+            statusText.textContent = `Transaction confirmée (${{data.txid}}). Téléchargement disponible.`;
+            downloadLink.classList.remove('hidden');
+          }} else {{
+            statusText.textContent = `Transaction détectée (${{data.txid}}). En attente de confirmation...`;
+            downloadLink.classList.add('hidden');
+          }}
+        }} catch (error) {{
+          errorText.textContent = `Impossible de vérifier le paiement: ${{error.message}}`;
+        }}
+      }}
+
+      refreshPaymentStatus();
+      setInterval(refreshPaymentStatus, 15000);
+    </script>
+  </body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send_json(self, status: int, data: dict):
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def send_text(self, status: int, text: str):
+        payload = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            html = render_index_html().encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            return
+
+        if path.startswith("/static/"):
+            relative = path.removeprefix("/static/")
+            file_path = STATIC_DIR / relative
+            if not file_path.exists() or not file_path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            content = file_path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime_type or "application/octet-stream")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        if path == "/api/payment-status":
+            try:
+                tx = get_latest_incoming_transaction(BTC_ADDRESS)
+            except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+                self.send_json(503, {"ok": False, "error": f"API indisponible: {exc}"})
+                return
+
+            if not tx:
+                self.send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "has_transaction": False,
+                        "message": "Aucune transaction entrante détectée pour le moment.",
+                    },
+                )
+                return
+
+            self.send_json(200, {"ok": True, "has_transaction": True, **tx})
+            return
+
+        if path == "/download/wallet-folder":
+            try:
+                tx = get_latest_incoming_transaction(BTC_ADDRESS)
+            except (urllib.error.URLError, TimeoutError, ValueError):
+                self.send_text(503, "Vérification du paiement impossible pour le moment.")
+                return
+
+            if not tx or tx["confirmations"] < 1:
+                self.send_text(403, "Téléchargement verrouillé: une confirmation est requise.")
+                return
+
+            if not WALLET_DIR.exists() or not WALLET_DIR.is_dir():
+                self.send_text(404, "Le dossier wallet_folder est introuvable.")
+                return
+
+            in_memory_zip = io.BytesIO()
+            with zipfile.ZipFile(in_memory_zip, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for file_path in WALLET_DIR.rglob("*"):
+                    if file_path.is_file():
+                        zip_file.write(file_path, file_path.relative_to(WALLET_DIR.parent))
+            payload = in_memory_zip.getvalue()
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", "attachment; filename=wallet_folder.zip")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+
+def run():
+    port = int(os.environ.get("PORT", "8000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"Server running on http://0.0.0.0:{port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    run()
